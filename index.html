@@ -525,7 +525,7 @@
                 <button type="button" onclick="closePasteModal()" class="text-[#8c7b70] hover:text-[#382e2b] text-2xl font-bold px-2 leading-none">&times;</button>
             </div>
             <div class="p-5">
-                <p class="text-xs text-[#6e6059] mb-3 leading-relaxed">無論您是點擊 Gemini 回覆下方的「複製」圖示，或是直接滑鼠反白選取整篇貼上，系統都會自動拆解黏連欄位並轉換成上下學期每週進度表：</p>
+                <p class="text-xs text-[#6e6059] mb-3 leading-relaxed">無論您是點擊 Gemini 回覆下方的「複製」圖示（含跨行 Markdown 表格），或是直接滑鼠反白選取整篇貼上，系統都會自動縫合與拆解並轉換成上下學期每週進度表：</p>
                 <textarea id="aiRawInput" rows="10" class="w-full p-3 border border-[#dfd2c5] rounded-xl text-xs font-mono bg-[#faf6f0] focus:bg-white focus:ring-2 focus:ring-[#7b8f7e] focus:outline-none leading-relaxed" placeholder="請在此按 Ctrl+V 貼上 AI 產出的完整文字..."></textarea>
                 <div class="flex justify-end gap-3 mt-4">
                     <button type="button" onclick="closePasteModal()" class="px-4 py-2 bg-[#f2ebe3] hover:bg-[#e6dbd0] text-[#574a44] font-semibold rounded-xl text-sm transition">取消</button>
@@ -680,7 +680,6 @@
                 .join('\n');
         }
 
-        // 針對瀏覽器反白複製 HTML 列表產生的跳號序號 (1., 3., 5., 7.) 重新正規化為 1., 2., 3., 4.
         function normalizeNumberedList(str) {
             if (!str) return "";
             const lines = cleanMarkdown(str).split('\n').filter(Boolean);
@@ -828,7 +827,7 @@
             }
 
             const fullPromptForGemini = `你是一位台灣資深特教老師。請根據以下資料，產出符合南投縣公版格式的「${domainName}教學計畫」。
-請嚴格遵守以下格式輸出，所有條列項目請直接用數字（1. 2. 3.）開頭，絕對不要使用任何星號（*）：
+請嚴格遵守以下格式輸出，所有條列項目請直接用數字（1. 2. 3.）開頭，絕對不要使用任何星號（*），且每個表格列請寫在同一行不要換行：
 
 ### 學習重點與目標
 重大議題及學習主題：
@@ -847,7 +846,7 @@
 | 週次 | 單元名稱 | 單元目標 |
 |---|---|---|
 | 1-4 | 一、單元名稱 | 1. 目標一<br>2. 目標二<br>3. 目標三<br>4. 目標四 |
-（請將每學期總週數 ${weeksPerSemester} 週平均分配為 5 個單元，每個單元約 3 至 4 週，且每個單元必須產出 4 個大方向單元目標，用 <br> 分隔）
+（請將每學期總週數 ${weeksPerSemester} 週平均分配為 5 個單元，每個單元約 3 至 4 週，且每個單元必須產出 4 個大方向單元目標，用 <br> 分隔，同一列請勿實體斷行）
 
 ### 第二學期
 | 週次 | 單元名稱 | 單元目標 |
@@ -886,27 +885,61 @@ ${promptText}`;
 
         function parseMarkdownTable(text) {
             if (!text) return [];
+
+            // 先將被 Gemini 拆成多行的 Markdown 表格列重新縫合成完整的一列
             const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
+            const mergedLines = [];
+            let buffer = "";
+
+            for (let i = 0; i < rawLines.length; i++) {
+                const line = rawLines[i];
+                if (buffer) {
+                    buffer += "\n" + line;
+                    const pipeCount = (buffer.match(/\|/g) || []).length;
+                    if (line.endsWith('|') && pipeCount >= 4) {
+                        mergedLines.push(buffer);
+                        buffer = "";
+                    }
+                } else if (line.startsWith('|')) {
+                    const pipeCount = (line.match(/\|/g) || []).length;
+                    if (line.endsWith('|') && pipeCount >= 4) {
+                        mergedLines.push(line);
+                    } else {
+                        buffer = line;
+                    }
+                } else {
+                    mergedLines.push(line);
+                }
+            }
+            if (buffer) mergedLines.push(buffer);
+
             const data = [];
 
-            // 情境 1：標準 Markdown 管線符號表格 (| 週次 | 單元名稱 | 單元目標 |)
-            const pipeLines = rawLines.filter(l => l.startsWith('|'));
+            // 情境 1：標準 Markdown 管線符號表格 (支援跨行儲存格)
+            const pipeLines = mergedLines.filter(l => l.startsWith('|'));
             if (pipeLines.length >= 2) {
-                let startIndex = 0;
-                if (pipeLines[0].includes('週次') || pipeLines[0].toLowerCase().includes('week')) {
-                    startIndex = 2;
-                }
-                for (let i = startIndex; i < pipeLines.length; i++) {
-                    if (/^\|[\s\-:]+\|/.test(pipeLines[i])) continue;
-                    const cells = pipeLines[i].split('|').slice(1, -1).map(c => cleanMarkdown(c.trim().replace(/<br\s*\/?>/gi, '\n')));
-                    if (cells.length >= 3 && cells[0]) {
-                        data.push(cells.slice(0, 3));
+                for (let i = 0; i < pipeLines.length; i++) {
+                    const rowStr = pipeLines[i];
+                    if (/^\|[\s\-:]+\|/.test(rowStr)) continue;
+                    if (rowStr.includes('週次') && rowStr.includes('單元名稱')) continue;
+
+                    const parts = rowStr.split('|');
+                    if (parts[0].trim() === '') parts.shift();
+                    if (parts.length > 0 && parts[parts.length - 1].trim() === '') parts.pop();
+
+                    if (parts.length >= 3) {
+                        const wk = cleanMarkdown(parts[0]);
+                        const title = cleanMarkdown(parts[1]);
+                        const goals = cleanMarkdown(parts.slice(2).join(' ').replace(/<br\s*\/?>/gi, '\n'));
+                        if (wk) {
+                            data.push([wk, title, goals]);
+                        }
                     }
                 }
                 if (data.length > 0) return data;
             }
 
-            // 情境 2：Tab 分隔表格 (週次 \t 單元名稱 \t 單元目標)
+            // 情境 2：Tab 分隔表格
             for (let i = 0; i < rawLines.length; i++) {
                 if (rawLines[i].includes('週次') && rawLines[i].includes('單元名稱')) continue;
                 if (rawLines[i].includes('\t')) {
@@ -918,20 +951,16 @@ ${promptText}`;
             }
             if (data.length > 0) return data;
 
-            // 情境 3：瀏覽器直接反白 HTML 表格後貼上的黏連格式
-            // 例如：「1. 週次單元名稱單元目標1-4一、情緒萬花筒能透過...」或「1. 5-8二、我的情緒小幫手能辨識...」
+            // 情境 3：網頁反白 HTML 表格後貼上的黏連格式
             let currentRow = null;
             let goalIdx = 1;
 
             for (let i = 0; i < rawLines.length; i++) {
                 let line = cleanMarkdown(rawLines[i]);
                 if (!line) continue;
-
-                // 剝除黏在開頭的「1. 週次單元名稱單元目標」表頭雜訊
                 line = line.replace(/^(?:\d+\.\s*)?週次\s*單元名稱\s*單元目標\s*/i, '');
                 if (!line) continue;
 
-                // 偵測新單元起始：可選序號(如 "1. ") + 週次(如 "1-4" 或 "17-21") + 中文數字單元名(如 "一、情緒萬花筒") + 後續第一條目標
                 const gluedMatch = line.match(/^(?:\d+\.\s*)?(\d+\s*[-~～至]\s*\d+)\s*([一二三四五六七八九十]+、[^能可學養建立體察辨認說做]+?)(?=(?:能|可|學習|認識|分辨|覺察|運用|辨識|了解|培養|養成|抑制|理解|嘗試|透過|面對|尊重|建立|展現|綜合))(.*)$/);
                 if (gluedMatch) {
                     if (currentRow) data.push(currentRow);
@@ -943,19 +972,6 @@ ${promptText}`;
                     continue;
                 }
 
-                // 備援偵測：若單元名稱與目標之間有空白分隔 (例如 "1. 5-8 二、單元名稱 1. 目標一")
-                const spacedWeekMatch = line.match(/^(?:\d+\.\s*)?(\d+\s*[-~～至]\s*\d+)\s+([一二三四五六七八九十]+、\S+)(?:\s+(.*))?$/);
-                if (spacedWeekMatch) {
-                    if (currentRow) data.push(currentRow);
-                    goalIdx = 1;
-                    const wk = spacedWeekMatch[1].replace(/\s+/g, '');
-                    const title = spacedWeekMatch[2].trim();
-                    const firstGoal = (spacedWeekMatch[3] || '').replace(/^\d+[\.\、]\s*/, '').trim();
-                    currentRow = [wk, title, firstGoal ? `${goalIdx++}. ${firstGoal}` : ''];
-                    continue;
-                }
-
-                // 備援偵測：單獨一行的週次 (例如 "1-4")
                 const pureWeekMatch = line.match(/^(?:第\s*)?(\d+\s*[-~～至]\s*\d+)(?:\s*週)?$/);
                 if (pureWeekMatch) {
                     if (currentRow) data.push(currentRow);
@@ -964,7 +980,6 @@ ${promptText}`;
                     continue;
                 }
 
-                // 屬於目前單元的後續目標行 (例如 "2. 能分辨正向情緒...")
                 if (currentRow) {
                     if (!currentRow[1]) {
                         currentRow[1] = line;
